@@ -1,0 +1,20 @@
+name: document-converter
+description: Convert PDF, DOCX, XLSX, PPTX, HTML, and images to Markdown via mineru-first degradation chain (PDF/images go to the MinerU cloud first).
+when_to_use:
+  - read this file
+  - convert to Markdown
+  - parse PDF
+  - ingest into wiki
+  - process a document
+  - OCR scanned PDF
+  - 读取文档
+  - 转换文档
+  - 入库
+  - 文档处理
+replaces: office-documents
+default_backend: auto
+fallbacks:
+  - docling
+  - vision
+  - markitdown
+  - format-specific direct readers
