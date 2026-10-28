@@ -1,16 +1,42 @@
 # MinerU Cloud Parsing (read chain)
 
-MinerU (mineru.net, OpenDataLab / Shanghai AI Lab) parses PDFs and images into
-Markdown with layout, table and formula recognition. This skill uses it as the
-**first tier for PDF and images only**; other formats stay local.
+MinerU (mineru.net, OpenDataLab / Shanghai AI Lab) parses documents into Markdown
+with layout, table and formula recognition. This skill uses it as the **first tier
+for every supported format** — PDF, images, Office (doc/docx/ppt/pptx/xls/xlsx) and
+HTML alike.
 
-Added 2026-10-17. Read chain only — `edit_*.py` are untouched.
+Added 2026-10-17 for PDF/images. Widened to all formats 2026-10-28.
+Read chain only — `edit_*.py` are untouched.
 
-## Why PDF/images only
+## Why every format
 
-The official API also accepts Office (doc/docx/ppt/pptx/xls/xlsx) and HTML, but
-this skill routes only PDF + images through it. Local docling already handles
-Office well, and routing Office to the cloud adds latency for no gain.
+Until 2026-10-28 only PDF and images were routed here, on the reasoning that
+"local docling already handles Office well". That reasoning held for ordinary
+documents but failed on wide tables: docling collapses a 19-column quality form
+into a single line of padding and the output gets truncated, while MinerU returns
+the same table with `colspan` intact. Measured on one file: docling 200113 bytes
+(mangled, truncated) vs MinerU 1237 bytes (complete, correct).
+
+MinerU is a first **attempt**, not a filter. Anything it cannot handle — file over
+200MB, unsupported type, network error, quota exhausted — falls through to the
+local chain (docling → Vision → markitdown → direct). The degradation order is
+unchanged; only the entry point moved.
+
+Cost: roughly 15 to 20 seconds per file plus cloud quota, versus local docling at
+6 to 20 seconds. For batch work, the free quota has a daily task cap (`-60018`).
+
+## Output shape
+
+`full.md` is a normal markdown file, but its tables are HTML blocks
+(`<table><tr><td>`, with `colspan` preserved). MinerU's markdown renderer does
+this by design — both `pipeline` and `vlm` behave the same, and no API parameter
+switches it to pipe tables. Body text, headings and lists are ordinary markdown.
+
+Both forms are valid markdown and Obsidian renders them. For retrieval, what
+matters is not the table syntax but whether the page was distilled: dumping raw
+converter output into the vault scores around 45% similarity against an
+equivalent query, while a distilled page on the same content scores 93%. Keep raw
+output as an intermediate artifact and write distilled markdown into the vault.
 
 ## Token
 

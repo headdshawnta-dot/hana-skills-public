@@ -288,10 +288,11 @@ def convert_doc_to_docx(doc_path: Path) -> Path | None:
     soffice = find_soffice()
     if not soffice:
         return None
+    import subprocess  # module-level import is absent; same pattern as other subprocess callers
     out_dir = doc_path.parent / f".doc-convert-{doc_path.stem}"
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        proc = subprocess.run(  # noqa: F821 (subprocess imported in main module)
+        proc = subprocess.run(
             [soffice, "--headless", "--convert-to", "docx", "--outdir", str(out_dir), str(doc_path)],
             timeout=120, capture_output=True, text=True,
             env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin", "HOME": str(Path.home())},
@@ -364,6 +365,28 @@ def try_vision(path: Path, *, timeout: int = 60) -> tuple[str | None, dict | Non
     return clean + "\n", {"reader": "vision"}, None
 
 
+def _docling_output_degenerate(text: str) -> str | None:
+    """Detect docling's silent wide-table collapse.
+
+    docling does not fail on a wide table — it emits ONE line where the whole
+    table is joined with padding spaces, exits 0, and reports success. Measured
+    on a 19-column quality form: 200105 chars, of which 92 were non-whitespace.
+    Anything downstream then treats a gutted document as a good conversion, which
+    is how batch runs silently drop files.
+
+    Returns a short reason string when the output looks unusable, else None.
+    """
+    if len(text) < 5000:
+        return None
+    longest = max((len(line) for line in text.splitlines()), default=0)
+    if longest > 5000:
+        return f"single line of {longest} chars"
+    nonws = len(re.sub(r"\s", "", text))
+    if nonws / max(len(text), 1) < 0.03:
+        return f"{nonws} non-whitespace chars in {len(text)}"
+    return None
+
+
 def try_docling(path: Path, *, timeout: int) -> tuple[str | None, dict | None, str | None]:
     """Run docling on the given path via its dedicated venv.
 
@@ -371,46 +394,67 @@ def try_docling(path: Path, *, timeout: int) -> tuple[str | None, dict | None, s
     """
     if not DOCLING_VENV_PYTHON.exists():
         return None, None, f"docling venv not found at {DOCLING_VENV_PYTHON}"
+    import subprocess
+    import tempfile
+    # Scratch dir lives in the OS temp area, not next to the source file, and is
+    # always removed in the finally block. Before 2026-10-28 this wrote
+    # `.docling-out-<stem>/` beside every input and never cleaned it up: 380
+    # stale dirs / 1.0G had accumulated in the source tree.
+    out_dir = Path(tempfile.mkdtemp(prefix="docling-out-"))
     try:
-        import subprocess
-        out_dir = path.parent / f".docling-out-{path.stem}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(
-            [
-                str(DOCLING_BIN),
-                str(path),
-                "--to", "md",
-                "--output", str(out_dir),
-            ],
-            timeout=timeout,
-            capture_output=True,
-            text=True,
-            # inherit PATH instead of overriding: docling's OCR stack (RapidOCR/
-            # torch) may resolve tools relative to the caller's PATH, and a
-            # trimmed PATH made PDF runs hang on first model init
-            # HF_HUB_OFFLINE=1: all docling models are cached locally
-            # (~/.cache/huggingface 6.9G); without it docling probes
-            # huggingface.co on every start and stalls ~5min on unreachable
-            # network before falling back to cache (measured 309s -> 9.6s)
-            env={"PYTHONUNBUFFERED": "1", "HF_HUB_OFFLINE": "1", **os.environ},
-        )
-    except subprocess.TimeoutExpired:
-        return None, None, f"docling timed out after {timeout}s"
-    except Exception as exc:
-        return None, None, f"docling failed: {type(exc).__name__}: {exc}"
+        try:
+            proc = subprocess.run(
+                [
+                    str(DOCLING_BIN),
+                    str(path),
+                    "--to", "md",
+                    "--output", str(out_dir),
+                ],
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+                # inherit PATH instead of overriding: docling's OCR stack (RapidOCR/
+                # torch) may resolve tools relative to the caller's PATH, and a
+                # trimmed PATH made PDF runs hang on first model init
+                # HF_HUB_OFFLINE=1: all docling models are cached locally
+                # (~/.cache/huggingface 6.9G); without it docling probes
+                # huggingface.co on every start and stalls ~5min on unreachable
+                # network before falling back to cache (measured 309s -> 9.6s)
+                # Proxy vars stripped: docling's httpx aborts with "Using SOCKS
+                # proxy, but the 'socksio' package is not installed" whenever
+                # http_proxy/https_proxy points at socks5://. docling runs fully
+                # offline here, so it must not see the caller's proxy at all.
+                env={
+                    **{k: v for k, v in os.environ.items()
+                       if k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}},
+                    "PYTHONUNBUFFERED": "1",
+                    "HF_HUB_OFFLINE": "1",
+                },
+            )
+        except subprocess.TimeoutExpired:
+            return None, None, f"docling timed out after {timeout}s"
+        except Exception as exc:
+            return None, None, f"docling failed: {type(exc).__name__}: {exc}"
 
-    if proc.returncode != 0:
-        err_lines = [l for l in (proc.stderr or "").splitlines() if l.strip()]
-        stderr = (err_lines[-1] if err_lines else "")[:300].strip()
-        return None, None, f"docling exited with code {proc.returncode}: {stderr}"
+        if proc.returncode != 0:
+            err_lines = [l for l in (proc.stderr or "").splitlines() if l.strip()]
+            stderr = (err_lines[-1] if err_lines else "")[:300].strip()
+            return None, None, f"docling exited with code {proc.returncode}: {stderr}"
 
-    md_files = list(out_dir.glob("*.md"))
-    if not md_files:
-        return None, None, "docling produced no .md output"
-    text = md_files[0].read_text("utf-8")
-    if not text.strip():
-        return None, None, "docling returned empty output"
-    return text, {"reader": "docling"}, None
+        md_files = list(out_dir.glob("*.md"))
+        if not md_files:
+            return None, None, "docling produced no .md output"
+        text = md_files[0].read_text("utf-8")
+        if not text.strip():
+            return None, None, "docling returned empty output"
+        degraded = _docling_output_degenerate(text)
+        if degraded:
+            # Treat a collapsed table as a failure so the chain keeps going: the
+            # next tiers (markitdown) return this content intact.
+            return None, None, f"docling output unusable ({degraded})"
+        return text, {"reader": "docling"}, None
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def write_conversion_log(output_path: Path, attempts: list) -> Path:
@@ -436,7 +480,18 @@ def write_conversion_log(output_path: Path, attempts: list) -> Path:
 # Only the read chain uses this; edit_*.py are untouched.
 # ─────────────────────────────────────────────────────────────
 
-MINERU_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".jp2", ".webp", ".gif", ".bmp"}
+MINERU_EXTS = {
+    # Documents: MinerU parses Office server-side. Widened 2026-10-28 from
+    # PDF/images only — local docling degrades badly on wide tables and MinerU
+    # keeps merged cells intact.
+    # .html/.htm are deliberately EXCLUDED: MinerU v4 rejects them with
+    # code=-10002 ("model_version 'vlm' cannot process html files") and the
+    # rejection is per-BATCH, so one html file fails every other file queued
+    # with it. HTML stays on the local chain.
+    ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
+    # Images
+    ".png", ".jpg", ".jpeg", ".jp2", ".webp", ".gif", ".bmp",
+}
 MINERU_API_BASE = "https://mineru.net/api/v4"
 MINERU_MODEL_VERSION = "vlm"          # official default is "pipeline"; vlm is recommended
 MINERU_TIMEOUT = 300                  # poll timeout (s); independent from docling's 600
@@ -445,8 +500,7 @@ MINERU_BATCH_LIMIT = 50               # official: <=50 upload links per file-url
 MINERU_MAX_BYTES = 200 * 1024 * 1024  # official: <=200MB per file
 MINERU_CRED_FILE = Path.home() / ".hanako" / "secrets" / "mineru.token"
 MINERU_NOT_SUPPORTED_REASON = (
-    "this skill's mineru backend only routes PDF/images "
-    "(MinerU itself also supports Office/HTML; not enabled here)"
+    "file type not accepted by the MinerU backend"
 )
 
 
@@ -469,11 +523,13 @@ def mineru_token() -> str | None:
 
 
 def rewrite_media_links(markdown: str, prefix: str) -> str:
-    """Rewrite markdown image targets that point into the zip's images/ dir.
+    """Rewrite image targets that point into the zip's images/ dir.
 
     prefix is the media dir name relative to the output file, e.g. "foo_mineru".
-    Only the URL segment of markdown image syntax is touched (never the body text).
-    Targets containing whitespace are wrapped in angle brackets.
+    Handles BOTH syntaxes MinerU emits: markdown ![alt](url) for PDF/doc, and
+    HTML <img src="url"> for docx — the docx form was left unprefixed until
+    2026-10-28, which produced broken image links.
+    Targets containing whitespace are wrapped in angle brackets (markdown form only).
     """
     def repl(match) -> str:
         alt, url = match.group(1), match.group(2)
@@ -483,6 +539,18 @@ def rewrite_media_links(markdown: str, prefix: str) -> str:
             url = f"<{url}>"
         return f"![{alt}]({url})"
 
+    markdown = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", repl, markdown)
+
+    def repl_img(match) -> str:
+        head, quoted, tail = match.group(1), match.group(2), match.group(3)
+        url = quoted.strip('"')
+        if url.startswith("images/"):
+            url = f"{prefix}/{url}"
+        return f'{head}"{url}"{tail}'
+
+    # <img ... src="images/..." ...>
+    return re.sub(r'(<img\b[^>]*?\bsrc=)("[^"]*")([^>]*>)', repl_img, markdown)
+
     return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", repl, markdown)
 
 
@@ -490,7 +558,7 @@ def _mineru_curl(args: list[str], *, timeout: int = 120):
     """Run curl (urllib gets Connection-reset against mineru.net; curl is fine)."""
     import subprocess
     return subprocess.run(
-        ["curl", "-sS", "--max-time", str(timeout), *args],
+        ["curl", "-g", "-sS", "--max-time", str(timeout), *args],
         capture_output=True, text=True,
     )
 

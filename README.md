@@ -10,7 +10,7 @@ Skill 是纯 Markdown 的指令文件（`SKILL.md` + 参考资料与脚本），
 
 把 PDF / DOCX / XLSX / PPTX / HTML / 图片转成 Markdown，并支持对 Office 文档做定点编辑。
 
-- PDF 与图片优先走 MinerU 云端（需要 `MINERU_TOKEN`），失败自动降级到本地链路
+- 所有支持的格式（PDF / 图片 / Word / Excel / PowerPoint）优先走 MinerU 云端（需要 `MINERU_TOKEN`），失败自动降级到本地链路；HTML 走本地
 - 本地链路：Docling、MarkItDown、pdfplumber、pypdf、python-docx/openpyxl/python-pptx
 - macOS 上额外的纯本地兜底：PDFKit + Vision 的 OCR 脚本（`bin/ocr-vision.swift`），一两秒一页
 - 自带 `references/licenses.md`，列清每个依赖的许可证；刻意不引用 Anthropic 那套 source-available 的 document skills

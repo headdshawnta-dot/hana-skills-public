@@ -270,6 +270,10 @@ def workbook_sheets(zf: zipfile.ZipFile) -> list[tuple[str, str]]:
 
 def read_xlsx(path: Path, max_rows: int, max_cols: int) -> tuple[str, list[str], dict]:
     warnings: list[str] = []
+    # 0 means "no limit", matching --max-chars. Before 2026-10-28 a 0 here silently
+    # produced an empty sheet, and README advised --max-rows 0 for full ledgers.
+    eff_rows = max_rows if max_rows > 0 else 1_000_000
+    eff_cols = max_cols if max_cols > 0 else 1000
     with zipfile.ZipFile(path) as zf:
         names = set(zf.namelist())
         if "xl/workbook.xml" not in names:
@@ -285,19 +289,29 @@ def read_xlsx(path: Path, max_rows: int, max_cols: int) -> tuple[str, list[str],
             root = ET.fromstring(zf.read(member))
             rows_out: list[list[str]] = []
             formula_count = 0
+            # Track what the limits throw away so the caller is told, instead of
+            # handing back a silently shortened sheet. Only rows that actually
+            # carry cells count: sheets often have thousands of blank formatting
+            # rows, and counting those produced bogus "truncated" warnings on
+            # sheets whose real content fit easily.
+            highest_row_index = 0
+            cols_dropped = 0
             for row in root.iter():
                 if local_name(row.tag) != "row":
                     continue
                 row_index = int(row.attrib.get("r", len(rows_out) + 1))
-                if row_index > max_rows:
+                if row_index > eff_rows:
+                    if any(local_name(c.tag) == "c" for c in row):
+                        highest_row_index = max(highest_row_index, row_index)
                     continue
-                values = [""] * max_cols
+                values = [""] * eff_cols
                 for cell in list(row):
                     if local_name(cell.tag) != "c":
                         continue
                     ref = cell.attrib.get("r", "")
                     col = cell_ref_to_col_index(ref) - 1
-                    if col < 0 or col >= max_cols:
+                    if col < 0 or col >= eff_cols:
+                        cols_dropped += 1
                         continue
                     cell_type = cell.attrib.get("t", "")
                     value = ""
@@ -325,8 +339,18 @@ def read_xlsx(path: Path, max_rows: int, max_cols: int) -> tuple[str, list[str],
                     values[col] = display
                 if any(values):
                     while rows_out and len(rows_out) < row_index - 1:
-                        rows_out.append([""] * max_cols)
+                        rows_out.append([""] * eff_cols)
                     rows_out.append(values)
+            if max_rows > 0 and highest_row_index > max_rows:
+                warnings.append(
+                    f"sheet '{sheet_name}': truncated at --max-rows={max_rows}, "
+                    f"source has {highest_row_index} row(s); raise --max-rows to see the rest"
+                )
+            if max_cols > 0 and cols_dropped:
+                warnings.append(
+                    f"sheet '{sheet_name}': {cols_dropped} cell(s) beyond --max-cols={max_cols} "
+                    f"dropped; raise --max-cols to see them"
+                )
             lines.append(f"## Sheet: {sheet_name}")
             lines.append("")
             if rows_out:
@@ -336,11 +360,11 @@ def read_xlsx(path: Path, max_rows: int, max_cols: int) -> tuple[str, list[str],
                         if value:
                             used_width = max(used_width, idx + 1)
                 used_width = max(1, used_width)
-                lines.append(markdown_table([row[:used_width] for row in rows_out[:max_rows]]))
+                lines.append(markdown_table([row[:used_width] for row in rows_out[:eff_rows]]))
             else:
                 lines.append("[Empty sheet]")
             lines.append("")
-            sheet_meta.append({"name": sheet_name, "part": member, "rows_shown": len(rows_out[:max_rows]), "formulas_shown": formula_count})
+            sheet_meta.append({"name": sheet_name, "part": member, "rows_shown": len(rows_out[:eff_rows]), "formulas_shown": formula_count})
         return "\n".join(lines).strip() + "\n", warnings, {"reader": "direct-ooxml", "sheets": sheet_meta}
 
 
@@ -495,9 +519,11 @@ def run_degradation_chain(
     ext = path.suffix.lower()  # defined before tiers: used by the mineru pre-filter below
 
     if backend == "auto":
-        # PDF/images go to MinerU cloud first (2026-10-17); non-PDF/image never enters
-        # the mineru tier (pre-filtered below). macOS Apple Silicon keeps Vision after
-        # docling for fast scanned-PDF OCR (2026-07-02).
+        # Every format in MINERU_EXTS goes to MinerU first (2026-10-28: widened from
+        # PDF/images; HTML stays local because MinerU rejects it per-batch). MinerU is a first ATTEMPT, not a filter — anything it cannot
+        # handle (oversize, unsupported type, network, quota) falls through to the
+        # local chain below. macOS Apple Silicon keeps Vision after docling for fast
+        # scanned-PDF OCR (2026-07-02).
         if is_macos_arm64():
             tiers = [BackendTier.MINERU, BackendTier.DOCLING, BackendTier.VISION, BackendTier.MARKITDOWN, BackendTier.DIRECT]
         else:
@@ -535,7 +561,7 @@ def run_degradation_chain(
             elif tier == BackendTier.DOCLING:
                 text, meta, warning = try_docling(path, timeout=timeout)
             elif tier == BackendTier.VISION:
-                text, meta, warning = try_vision(path, timeout=min(timeout, 60))
+                text, meta, warning = try_vision(path, timeout=min(timeout, 600))
             elif tier == BackendTier.MARKITDOWN:
                 text, warning = try_markitdown(path)
                 meta = {"reader": "markitdown"} if text else None

@@ -1,4 +1,5 @@
 name: document-converter
+version: "2026.10.28.1"
 description: Convert PDF, DOCX, XLSX, PPTX, HTML, and images to Markdown via mineru-first degradation chain (PDF/images go to the MinerU cloud first).
 when_to_use:
   - read this file
@@ -14,6 +15,7 @@ when_to_use:
 replaces: office-documents
 default_backend: auto
 fallbacks:
+  - mineru
   - docling
   - vision
   - markitdown

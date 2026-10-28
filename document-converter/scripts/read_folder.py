@@ -2,7 +2,7 @@
 """Read a folder of documents.
 
 Routing (--backend auto, the default):
-  - PDF/images      -> MinerU cloud, submitted in batches (shared with try_mineru)
+  - MINERU_EXTS      -> MinerU cloud, submitted in batches (shared with try_mineru)
   - everything else -> local chain via read_document.py
 
 Cloud failures fall back to the local chain (--backend local, no mineru).
@@ -73,6 +73,30 @@ def plan_outputs(out_dir: Path, root: Path, files: list[Path]) -> dict[Path, Pat
     return mapping
 
 
+def _actual_reader(md: Path, backend: str) -> str | None:
+    """Which backend actually produced md.
+
+    The requested backend is not the answer: 'auto' can end on markitdown and
+    'local' starts at docling, so a summary claiming reader=auto told you nothing.
+    With a .conversion.log the last successful line names the winner; with no log
+    the first tier succeeded cleanly.
+    """
+    log = md.with_suffix(md.suffix + ".conversion.log")
+    if log.exists():
+        winner = None
+        for line in log.read_text("utf-8", "replace").splitlines():
+            if line.startswith("backend=") and "status=ok" in line:
+                winner = line.split(",", 1)[0].replace("backend=", "").strip()
+        if winner:
+            return winner
+    first_tier = {
+        "local": "docling", "auto": "mineru", "mineru": "mineru",
+        "docling": "docling", "vision": "vision",
+        "markitdown": "markitdown", "direct": "direct",
+    }
+    return first_tier.get(backend, backend)
+
+
 def run_local(src: Path, md: Path, backend: str, args: argparse.Namespace) -> dict:
     """Convert one file through the local chain (via read_document.py subprocess)."""
     cmd = [
@@ -88,14 +112,14 @@ def run_local(src: Path, md: Path, backend: str, args: argparse.Namespace) -> di
     ok = proc.returncode == 0 and md.exists() and md.stat().st_size > 0
     return {
         "status": "ok" if ok else "fail",
-        "reader": backend if ok else None,
+        "reader": _actual_reader(md, backend) if ok else None,
         "error": None if ok else (proc.stderr or proc.stdout or "read_document.py failed").strip()[-300:],
     }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Read a folder of documents (mineru cloud for PDF/images, local chain otherwise).")
+        description="Read a folder of documents (MinerU cloud first, local chain as fallback).")
     ap.add_argument("input", help="Input folder.")
     ap.add_argument("--output-dir", required=True, help="Output folder for .md files, media, logs, and _summary.")
     ap.add_argument("--backend", choices=["auto", "mineru", "local", "docling", "vision", "markitdown", "direct"], default="auto")
@@ -154,16 +178,26 @@ def main() -> int:
                                 "status": "ok", "elapsed": v.get("elapsed"), "error": None})
                 continue
             if v.get("precheck"):
-                # unsupported extension / oversize: hard fail, do NOT retry locally
-                records.append({"input": str(src), "output": None, "reader": None,
-                                "status": "fail", "elapsed": v.get("elapsed"),
-                                "error": v.get("reason")})
+                # MinerU refused on a precheck rule (unsupported type / oversize).
+                # Still try the local chain: docling reads a 201MB PDF that MinerU
+                # rejects, so hard-failing here used to drop a convertible file.
+                # The MinerU reason is kept so the summary shows why it never
+                # came from the cloud.
+                res = run_local(src, md, "local", args)
+                records.append({"input": str(src), "output": str(md) if res["status"] == "ok" else None,
+                                "reader": res.get("reader"), "status": res["status"],
+                                "elapsed": v.get("elapsed"),
+                                "mineru_status": v.get("status"),
+                                "mineru_reason": v.get("reason"),
+                                "error": None if res["status"] == "ok" else (res.get("error") or v.get("reason"))})
                 continue
             # cloud failure: fall back to the local chain (no mineru)
             res = run_local(src, md, "local", args)
             records.append({"input": str(src), "output": str(md) if res["status"] == "ok" else None,
                             "reader": res.get("reader"), "status": res["status"],
                             "elapsed": v.get("elapsed"),
+                            "mineru_status": v.get("status"),
+                            "mineru_reason": v.get("reason"),
                             "error": None if res["status"] == "ok" else (v.get("reason") or res.get("error"))})
 
     # --- local group ---
