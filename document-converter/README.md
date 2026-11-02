@@ -122,7 +122,7 @@ backend=docling, status=ok, elapsed=17.8s
 
 **1. 文件名含方括号，MinerU 上传必失败**（2026-10-28 已修）
 
-`curl` 默认把参数里的 `[]` 当 URL 字符范围解析，`[项目甲]故障报告.pdf` 会被当成 glob 报 `curl: (3) bad range in URL`。中文项目文件普遍用这种命名，等于 MinerU 完全用不上。
+`curl` 默认把参数里的 `[]` 当 URL 字符范围解析，`[Z4]故障报告.pdf` 会被当成 glob 报 `curl: (3) bad range in URL`。中文项目文件普遍用这种命名，等于 MinerU 完全用不上。
 
 修法：`_mineru_curl` 的 curl 参数加 `-g` 关闭 glob。
 
